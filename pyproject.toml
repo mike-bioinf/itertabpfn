@@ -4,7 +4,12 @@ version = "0.1"
 dependencies = [
     "pydantic==2.10.5",
     "tabpfn==2.0.1",
-    "sklearn",
+    "scikit-learn",
     "pandas",
     "numpy"
     ]
+
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"

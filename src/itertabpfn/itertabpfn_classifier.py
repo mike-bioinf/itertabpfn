@@ -6,7 +6,7 @@ from tabpfn import TabPFNClassifier
 from tabpfn_extensions.post_hoc_ensembles.sklearn_interface import AutoTabPFNClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import recall_score, precision_score, f1_score, accuracy_score, roc_auc_score
-from validators import check_target_cols
+from itertabpfn.validators import check_target_cols
 
 
 
@@ -22,15 +22,15 @@ class IterTabPFNClassifier(BaseModel):
     that have already been processed.
 
     Parameters:
-        datasets dict[str: tuple(pd.DataFrame, str)]): 
+        datasets (dict[str: tuple(pd.DataFrame, str)]): 
             Dictionary of binary tuples consisting in a pandas Dataframe and a string specifying the name of the target column. 
             The dict keys must be strings identifying the datasets.
-        context_sizes set[float]: 
-            A set of floats representing the context sizes to be used during inference. 
+        context_sizes (set[float]): 
+            A set of floats representing the context sizes precentages to be used during inference. 
             If multiple values are provided, all combinations with the random states values are tried.
             This must always be a set, even if it contains only a single value.
         random_states (set[int]): 
-            set of integers indicating the seeds to use. 
+            Set of integers indicating the seeds to use. 
             If multiple values are provided, all combinations with the context size values are tried.
             Must be always a set even if one value is passed.
     '''
@@ -43,8 +43,16 @@ class IterTabPFNClassifier(BaseModel):
     ensemble_clf_config: dict = None
     simple_register: dict[str, dict[str, list]] = {}
     ensemble_register:  dict[str, dict[str, list]] = {}
-    df_columns_names: list[str] = ["dataset", "context_size", "random_state", "model_type", "recall","precision", "f1", "accuracy", "auc"]
-    pred_dataframe: pd.DataFrame = pd.DataFrame(columns=["dataset", "context_size", "random_state", "model_type", "recall","precision", "f1", "accuracy", "auc"])
+    df_columns_names: list[str] = [
+        "dataset", "context_size", "random_state", "model_type", "recall", "precision", "f1", 
+        "accuracy", "auc", "array_test_label", "array_pred_label", "array_class1_pred_proba"
+    ]
+    pred_dataframe: pd.DataFrame = pd.DataFrame(
+        columns=[
+            "dataset", "context_size", "random_state", "model_type", "recall","precision",
+            "f1", "accuracy", "auc", "array_test_label", "array_pred_label", "array_class1_pred_proba"
+        ]
+    )
 
 
     class Config:
@@ -68,11 +76,12 @@ class IterTabPFNClassifier(BaseModel):
     def set_simple_classifier(self, **kwargs) -> None:
         '''
         Set a simple classifier. Overwrite the pre-existing simple classifier.
-        Parameters: Take all parameters taken by TabPFNClassifier class by keywords only.
+        Parameters: 
+            Take all parameters taken by TabPFNClassifier class by keywords only.
         Returns: None
         '''
         self.simple_clf = TabPFNClassifier(**kwargs)
-        self.simple_clf_config = {**kwargs}
+        self.simple_clf_config = kwargs
 
 
 
@@ -81,19 +90,23 @@ class IterTabPFNClassifier(BaseModel):
         Set the instructions to build ensemble classifiers using GES tecnique on a random portfolio of pre-available tabpfn models.
         The ensemble classifiers will be build later on every dataset at fit/inference time (very time consuming especially without gpu).
         Calling this method overwrite/cancel the pre-existent fitted ensemble classifier.
-        Parameters: **kwargs: Take all parameters taken by AutoTabPFNClassifier class by keywords only.
+        Parameters: 
+            **kwargs: 
+                Take all parameters taken by AutoTabPFNClassifier class by keywords only.
         Returns: None
         '''
         self.ensemble_clf = AutoTabPFNClassifier(**kwargs)
-        self.ensemble_clf_config = {**kwargs}
+        self.ensemble_clf_config = kwargs
 
 
 
     @validate_call(config=ConfigDict(arbitrary_types_allowed=True))
     def add_datasets(self, other_datasets: dict[str, tuple[pd.DataFrame, str]]) -> None:
         '''
-        Add datasets to te instance.
-        Parameters: other_datasets(dict[str: tuple(pd.DataFrame, str)]): A dictionary of datasets added to the initializating ones. No duplicates in keys are allowed.
+        Add datasets to the instance.
+        Parameters: 
+            other_datasets (dict[str: tuple(pd.DataFrame, str)]): 
+                A dictionary of datasets added to the initializating ones. No duplicates in keys are allowed.
         Returns: None
         '''
         check_target_cols(other_datasets)
@@ -109,14 +122,18 @@ class IterTabPFNClassifier(BaseModel):
     
 
     @validate_call
-    def modify_random_states(self, random_states: set[PositiveInt], mode = Literal["add", "remove", "replace"]):
+    def modify_random_states(self, random_states: set[PositiveInt], mode = Literal["add", "remove", "replace"]) -> None:
         '''
         Modify random states attribute.
-        Parameters: mode (Literal["add", "remove", "replace"]): 
-            Specify what tyoe of modification to apport with the new values:
-            "add" = the new values are added to the existing ones (Union operation);
-            "remove" = the new values are subtracted from the existing ones (Difference operation);
-            "replace" = the new values replace the old ones. 
+        Parameters:
+            random_states (set[PositiveInt]):
+                Set of integers indicating the seeds to use.   
+            mode (Literal["add", "remove", "replace"]): 
+                Specify what type of modification to apport with the new values:
+                "add" = the new values are added to the existing ones (Union operation);
+                "remove" = the new values are subtracted from the existing ones (Difference operation);
+                "replace" = the new values replace the old ones. 
+        Returns: None
         '''
         self.random_states = self._apply_modify(random_states, mode, "random_states")
 
@@ -149,8 +166,10 @@ class IterTabPFNClassifier(BaseModel):
         A configuration is a unique combination of (dataset, context_size, random_state).
         The original fit tabpfn method is solely used to pass the input data since ICL does not involve real training.
         In this implementation the two step are merged in one in order to use the same model to iterate over all datasets. 
-        Parameters: types: list (always) with at least one of the two possible strings "simple" and "ensemble".
-        Returns: None.       
+        Parameters: 
+            types (list[Literal["simple", "ensemble"]]): 
+                list (always) with at least one of the two possible strings "simple" and "ensemble".
+        Returns: None       
         '''
         self._validate_classifiers_presence(types)
         pred_rows = self._generate_predictions(types)
@@ -202,16 +221,19 @@ class IterTabPFNClassifier(BaseModel):
 
     def _get_configurations(self) -> Generator[dict, None, None]:
         '''
-        Generate all possible configurations from current setting.
+        Generate all possible configurations from the current setting. Evaluate the "binary" or "multiclass" nature of the target variable. 
+        This info will be then used to decide about the return of the predicted probabilities. In detail these will be not returned in multiclass cases.
         Returns: A generator object yielding a configuration dict.
         '''
         for name, (data, target) in self.datasets.items():
+            nature_target = "binary" if len(data[target].unique() == 2) else "multiclass"
             for context_size in self.context_sizes:
                 for random_state in self.random_states:
                     yield {
                         "name": name,
                         "data": data,
                         "target": target,
+                        "nature_target": nature_target,
                         "context_size": context_size,
                         "random_state": random_state
                     }
@@ -265,21 +287,21 @@ class IterTabPFNClassifier(BaseModel):
         Wrapper of sklearn train_test_split function.
         Returns: tuple of four elements in the following order X_train, X_test, y_train and y_test.
         '''
-        X = data.drop(target, axis=1)
-        y = data.loc[:, target]
+        X = data.drop(target, axis=1).to_numpy()
+        y = data.loc[:, target].to_numpy()
         return train_test_split(X, y, train_size=context_size, random_state=random_state)
 
 
 
     def _execute_prediction_pipeline(self, dataset_name, context_size, random_state, X_train, X_test, y_train, y_test, type: Literal["simple", "ensemble"]) -> list:
         '''
-        Execute the prediction pipeline comprhensive of prediction computation, performance computation, registers update and dataframe row construction.
+        Execute the prediction pipeline comprehensive of prediction computation, performance computation, registers update and dataframe row construction.
         Returns: A list representing a future df row (see the order of elements below).
         '''
         self._update_register(dataset_name, context_size, random_state, type)
         y_pred, y_pred_prob = self._predict(X_train, X_test, y_train, type)
         recall, precision, f1, accuracy, auc = self._compute_performance(y_test, y_pred, y_pred_prob)
-        return [dataset_name, context_size, random_state, type, recall, precision, f1, accuracy, auc]
+        return [dataset_name, context_size, random_state, type, recall, precision, f1, accuracy, auc, y_test.tolist(), y_pred.tolist(), y_pred_prob.tolist()]
 
 
 
@@ -300,8 +322,8 @@ class IterTabPFNClassifier(BaseModel):
 
     def _predict(self, X_train, X_test, y_train, type: Literal["simple", "ensemble"]) -> tuple[np.ndarray, np.ndarray]:
         '''
-        Compute y labels and 1-encoded class probabilities predictions and returns them.
-        Returns: Binary tuple of one dimensional numpy arrays of predicated labels and probabilities.
+        Predict y labels and the probabilities of the class encoded as 1.
+        Returns: Binary tuple of 1D numpy arrays of predicated labels and probabilities.
         '''
         clf = self.simple_clf if type == "simple" else self.ensemble_clf
         clf.fit(X_train, y_train)
@@ -328,7 +350,7 @@ class IterTabPFNClassifier(BaseModel):
 
     def save_pred_dataframe(self, file: str, sep: str = "\t"):
         '''
-        Save the dataframe into a txt file.
+        Save the pred_dataframe attribute into a txt file.
         Parameters:
             file (str): filename path.
             sep (str): string used as sep. Defaults to "\t".
