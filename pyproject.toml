@@ -3,7 +3,7 @@ name = "itertabpfn"
 version = "0.1"
 dependencies = [
     "pydantic==2.10.5",
-    "tabpfn==2.0.1",
+    "tabpfn>=2.0.1",
     "scikit-learn",
     "pandas",
     "numpy"

@@ -5,8 +5,7 @@ from typing import Literal, Generator
 from tabpfn import TabPFNClassifier
 from tabpfn_extensions.post_hoc_ensembles.sklearn_interface import AutoTabPFNClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import recall_score, precision_score, f1_score, accuracy_score, roc_auc_score
-from itertabpfn.validators import check_target_cols
+from itertabpfn.pre_validation import check_target_cols, cast_target_cols
 
 
 
@@ -44,13 +43,13 @@ class IterTabPFNClassifier(BaseModel):
     simple_register: dict[str, dict[str, list]] = {}
     ensemble_register:  dict[str, dict[str, list]] = {}
     df_columns_names: list[str] = [
-        "dataset", "context_size", "random_state", "model_type", "recall", "precision", "f1", 
-        "accuracy", "auc", "array_test_label", "array_pred_label", "array_class1_pred_proba"
+        "dataset", "context_size", "random_state", "type_classifier", "class_setting", "number_classes",
+        "array_test_label", "array_pred_label", "array_pred_proba"
     ]
     pred_dataframe: pd.DataFrame = pd.DataFrame(
         columns=[
-            "dataset", "context_size", "random_state", "model_type", "recall","precision",
-            "f1", "accuracy", "auc", "array_test_label", "array_pred_label", "array_class1_pred_proba"
+            "dataset", "context_size", "random_state", "type_classifier", "class_setting", "number_classes",
+            "array_test_label", "array_pred_label", "array_pred_proba"
         ]
     )
 
@@ -62,8 +61,9 @@ class IterTabPFNClassifier(BaseModel):
 
     @field_validator("datasets")
     @classmethod
-    def _check_target_cols(cls, datasets):
+    def _manage_target_cols(cls, datasets):
         check_target_cols(datasets)
+        datasets = cast_target_cols(datasets)
         return datasets
 
 
@@ -130,8 +130,8 @@ class IterTabPFNClassifier(BaseModel):
                 Set of integers indicating the seeds to use.   
             mode (Literal["add", "remove", "replace"]): 
                 Specify what type of modification to apport with the new values:
-                "add" = the new values are added to the existing ones (Union operation);
-                "remove" = the new values are subtracted from the existing ones (Difference operation);
+                "add" = the new values are added to the existing ones (Union operation)
+                "remove" = the new values are subtracted from the existing ones (Difference operation)
                 "replace" = the new values replace the old ones. 
         Returns: None
         '''
@@ -165,10 +165,15 @@ class IterTabPFNClassifier(BaseModel):
         Perform predictions for specified classifier type(s) on all unprocessed configurations.
         A configuration is a unique combination of (dataset, context_size, random_state).
         The original fit tabpfn method is solely used to pass the input data since ICL does not involve real training.
-        In this implementation the two step are merged in one in order to use the same model to iterate over all datasets. 
+        However for ensemble methods a learning phase on the training set (SHOULD be the one passed as context otherwise --> TO CHECK)
+        is done in order to learn the ensemble. 
+        Either the case in this implementation traditional fit and predict methods are merged into this single one. 
+        The predictions consists in both "raw" labels and probability estimates. In addition also the true labels
+        and the number of samples for each class starting from the 0 encoded class and going up are reported.
+        All this info is added to a single dataframe (see attribute "pred_dataframe").
         Parameters: 
             types (list[Literal["simple", "ensemble"]]): 
-                list (always) with at least one of the two possible strings "simple" and "ensemble".
+                list with at least one of the two possible strings "simple" and "ensemble". It muset be always a list.
         Returns: None       
         '''
         self._validate_classifiers_presence(types)
@@ -185,7 +190,7 @@ class IterTabPFNClassifier(BaseModel):
         if new_rows: 
             pred_df = pd.DataFrame(new_rows, columns=self.df_columns_names)
             self.pred_dataframe = pd.concat([self.pred_dataframe, pred_df], ignore_index=True)
-            self.pred_dataframe.sort_values(by=["model_type", "dataset", "context_size", "random_state", "auc"], axis=0, inplace=True)
+            self.pred_dataframe.sort_values(by=["type_classifier", "dataset", "context_size", "random_state"], axis=0, inplace=True)
 
 
 
@@ -204,36 +209,32 @@ class IterTabPFNClassifier(BaseModel):
     def _generate_predictions(self, types: list[Literal["simple", "ensemble"]]) -> list[list]:
         '''
         Generate predictions for all unprocessed configurations.
+        The result obtained for each configuration is a list that "act" as dataframe row.
         Returns: A list of sublist with config and predictive info in a specific order.
         '''
         predictions = []
-
         for config in self._get_configurations():
             types_to_process = self._get_types_to_process(config, types)
             if not types_to_process: 
                 continue
             for type_to_process in types_to_process:
                 predictions.append(self._process_configuration(config, type_to_process))
-                
         return predictions
 
 
 
     def _get_configurations(self) -> Generator[dict, None, None]:
         '''
-        Generate all possible configurations from the current setting. Evaluate the "binary" or "multiclass" nature of the target variable. 
-        This info will be then used to decide about the return of the predicted probabilities. In detail these will be not returned in multiclass cases.
+        Generate all possible configurations from the current setting.
         Returns: A generator object yielding a configuration dict.
         '''
         for name, (data, target) in self.datasets.items():
-            nature_target = "binary" if len(data[target].unique() == 2) else "multiclass"
             for context_size in self.context_sizes:
                 for random_state in self.random_states:
                     yield {
                         "name": name,
                         "data": data,
                         "target": target,
-                        "nature_target": nature_target,
                         "context_size": context_size,
                         "random_state": random_state
                     }
@@ -272,12 +273,17 @@ class IterTabPFNClassifier(BaseModel):
 
     def _process_configuration(self, config: dict, type: Literal["simple", "ensemble"]) -> list:
         '''
-        Process a specific configurations with a specific classifier.
+        Process a specific configurations with the classifier of the selected type.
+        Manage the update of registers, the predective inference and dataframe row construction (returned in output).
         Returns: list with the configuration and predictive performance details in a specific order. 
         '''
         data, target, name, context_size, random_state = config["data"], config["target"], config["name"], config["context_size"], config["random_state"]
         X_train, X_test, y_train, y_test = self._split_dataset(data, target, context_size, random_state)
-        return self._execute_prediction_pipeline(name, context_size, random_state, X_train, X_test, y_train, y_test, type)
+        self._update_register(name, context_size, random_state, type)
+        y_pred, y_pred_prob = self._predict(X_train, X_test, y_train, type)
+        class_setting = "binary" if y_pred_prob.shape[1] == 2 else "multiclass"
+        number_classes = np.unique(y_test, return_counts=True)
+        return [name, context_size, random_state, type, class_setting, number_classes, y_test, y_pred, y_pred_prob] 
 
 
 
@@ -289,19 +295,7 @@ class IterTabPFNClassifier(BaseModel):
         '''
         X = data.drop(target, axis=1).to_numpy()
         y = data.loc[:, target].to_numpy()
-        return train_test_split(X, y, train_size=context_size, random_state=random_state)
-
-
-
-    def _execute_prediction_pipeline(self, dataset_name, context_size, random_state, X_train, X_test, y_train, y_test, type: Literal["simple", "ensemble"]) -> list:
-        '''
-        Execute the prediction pipeline comprehensive of prediction computation, performance computation, registers update and dataframe row construction.
-        Returns: A list representing a future df row (see the order of elements below).
-        '''
-        self._update_register(dataset_name, context_size, random_state, type)
-        y_pred, y_pred_prob = self._predict(X_train, X_test, y_train, type)
-        recall, precision, f1, accuracy, auc = self._compute_performance(y_test, y_pred, y_pred_prob)
-        return [dataset_name, context_size, random_state, type, recall, precision, f1, accuracy, auc, y_test.tolist(), y_pred.tolist(), y_pred_prob.tolist()]
+        return train_test_split(X, y, train_size=context_size, random_state=random_state, stratify=y)
 
 
 
@@ -328,25 +322,10 @@ class IterTabPFNClassifier(BaseModel):
         clf = self.simple_clf if type == "simple" else self.ensemble_clf
         clf.fit(X_train, y_train)
         pred = clf.predict(X_test)
-        pred_prob = clf.predict_proba(X_test)[:, 1]
+        pred_prob = clf.predict_proba(X_test)
         return (pred, pred_prob)
         
         
-
-    @staticmethod
-    def _compute_performance(y_true: np.ndarray, y_pred: np.ndarray, y_pred_prob: np.ndarray) -> tuple[float]:
-        '''
-        Computes some pre-defined perfomance metrics (recall, precision, f1, accuracy and auc).
-        Returns a tuple of performances in a specific order (see above).
-        '''
-        recall = recall_score(y_true, y_pred)
-        precision = precision_score(y_true, y_pred)
-        f1 = f1_score(y_true, y_pred)
-        accuracy = accuracy_score(y_true, y_pred)
-        auc = roc_auc_score(y_true, y_pred_prob)
-        return recall, precision, f1, accuracy, auc
-    
-
 
     def save_pred_dataframe(self, file: str, sep: str = "\t"):
         '''
