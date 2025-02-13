@@ -16,13 +16,14 @@ def compute_metrics(row: pd.Series) -> pd.Series:
         row (pd.Series): row passed by the "apply" method.
     Returns: An indexed Series of recall, precision, f1, accuracy and AUC value/s.
     '''
-    y_true, y_pred, y_pred_prob, class_setting = row["array_test_label"], row["array_pred_label"], row["array_pred_proba"], row["class_setting"]
-    average = "binary" if class_setting == "binary" else None
-    # raise is the default value for the binary case in the scikit implementation
-    multi_class = "raise" if class_setting == "binary" else "ovr"
-    precision, recall, f1, _  = precision_recall_fscore_support(y_true, y_pred, average=average, zero_division=np.nan)
+    y_true, y_pred, y_pred_proba, class_setting = row["array_test_label"], row["array_pred_label"], row["array_pred_proba"], row["class_setting"]
+    prf_average = "binary" if class_setting == "binary" else None
+    y_pred_proba = y_pred_proba[:, 1] if class_setting == "binary" else y_pred_proba
+    precision, recall, f1, _  = precision_recall_fscore_support(y_true, y_pred, average=prf_average, zero_division=np.nan)
     accuracy = accuracy_score(y_true, y_pred)
-    auc = roc_auc_score(y_true, y_pred_prob, average=average, multi_class=multi_class)
+    # "raise" is the default value for the binary case in sklearn implementation
+    auc_multi_class = "raise" if class_setting == "binary" else "ovr"
+    auc = roc_auc_score(y_true, y_pred_proba, average=None, multi_class=auc_multi_class)
     return pd.Series({"recall": recall, "precision": precision, "f1": f1, "accuracy": accuracy, "auc": auc})
     
 
