@@ -327,11 +327,12 @@ class IterTabPFNClassifier(BaseModel):
         
         
 
-    def save_pred_dataframe(self, file: str, sep: str = "\t"):
+    def save_pred_dataframe(self, file: str, sep: str = "\t") -> None:
         '''
         Save the pred_dataframe attribute into a txt file.
         Parameters:
             file (str): filename path.
             sep (str): string used as sep. Defaults to "\t".
+        Returns: None
         '''
         self.pred_dataframe.to_csv(file, sep=sep, index=False)
