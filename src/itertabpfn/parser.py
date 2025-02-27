@@ -11,7 +11,7 @@ def parse_pred_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     In particular the "number_classes" values are converted to binary tuples of numpy arrays.
     The function expects all columns to be present. If one of them is missing an error is raised.
     Parameters:
-        df: prediction dataframe returned by the IterTabPFNClassifier class.
+        df (pd.DataFrame) : prediction dataframe returned by the IterTabPFNClassifier class.
     Returns: The parsed DataFrame.
     '''
     columns_to_parse = ["number_classes", "array_test_label", "array_pred_label", "array_pred_proba"]
