@@ -22,9 +22,12 @@ from itertabpfn.finetune.setup import FineTuneSetup, OptSetup
 
 class OptFineTuneTabpfn:
     '''
-    Implements a fine tuning strategy for tabpfn classifiers with AES and hyperparameter optimization.
-    The procedure works on a single dataframe.
-    The learning rate and batch size are the learnable HPs, with the first sampled exponentially and the second linearly. 
+    This class implements a fine-tuning strategy for tabpfn classifiers using AES, with hyperparameter optimization.
+    The procedure is designed to work with a single dataframe.
+    The optimization process is integrated into the Optuna framework. 
+    Specifically, an instance of this class should be passed to the optimize method of an Optuna Study object.
+    The learning rate and batch size are treated as tunable hyperparameters. 
+    The learning rate is sampled exponentially, while the batch size is sampled linearly.
     
     The fine-tuning procedure implements three stopping logic:
         1) early stopping on training time;
@@ -35,7 +38,8 @@ class OptFineTuneTabpfn:
     Parameters:
         path_base_model (str | Path | Literal["auto"], optional): 
             Path to the base tabpfn model. Defaults to "auto", in which case the model is founded automatically using tabpfn utilities.
-        save_path_fine_tuned_model (str | Path): Path where to save the finetuned models.
+        save_path_fine_tuned_model (str | Path | None): Location where to save the finetuned model.
+            Leave as None if only HPO works has to be done, since the underlying models cannot be saved.
         X_train (pd.DataFrame): training pandas dataframe.
         y_train (pd.Series): training target series.
         X_val (pd.DataFrame): validation pandas dataframe.
@@ -43,9 +47,7 @@ class OptFineTuneTabpfn:
         fine_tune_setup (FineTuneSetup): FineTuneSetup instance with the finetune directivies.
         opt_setup (OptSetup): OptSetup instance containing the optimization directivies. 
         softmax_temperature (float, optional): Number between 0 and 1.
-            The rate of increase in patience. Set to 0 to disable, or negative to shrink patience during training.
-        random_seed (int, optional): seed that control the randomness.
-            Setting this seed means estabishiling reproducibile seeds for all the involved random processes. Default to 50.
+        random_seed (int, optional): Seed that control the randomness for all the processed involved. Defaults to 50.
         device (Literal["auto"], optional): Search automaticaly for the GPU falling otherwise on the CPU.
         
     ----------
@@ -64,7 +66,7 @@ class OptFineTuneTabpfn:
     max_steps (int): Maximum number of learning step.
     
     use_autocast (bool): True if the GPU is available and False otherwise.
-        Enable mized precision training (stable only on the GPU).
+        Enable mixed precision training (stable only on GPU).
     n_classes (int): Number of classes determined by the number of different labels of the y training set.
     trials_reports (list[list]): Reports info about the fine tuning process for every trials.
         This are ordered in increasing order (from trial 0 to N). 
@@ -76,7 +78,7 @@ class OptFineTuneTabpfn:
         self,
         *,
         path_base_model: str | Path | Literal["auto"] = "auto",
-        save_path_fine_tuned_model: str | Path,
+        save_path_fine_tuned_model: str | Path | None, 
         X_train: pd.DataFrame,
         y_train: pd.Series,
         X_val: pd.DataFrame, 
@@ -414,10 +416,10 @@ class OptFineTuneTabpfn:
 
 
 
-    def get_df_trials_reports(self) -> pd.DataFrame:
+    def get_df_trials_reports(self) -> pd.DataFrame | None:
         '''
-        Organize the trials reports in a panadas dataframe. 
-        Note this is returned and not stored in place.
+        Organize the trials reports in a pandas DataFrame.
+        Note the dataframe is returned and not stored in place.
         Returns: The dataframe or None if no trial information is available.
         '''
         if self.trials_reports:

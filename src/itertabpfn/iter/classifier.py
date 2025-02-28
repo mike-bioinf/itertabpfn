@@ -5,7 +5,7 @@ from typing import Literal, Generator
 from tabpfn import TabPFNClassifier
 from tabpfn_extensions.post_hoc_ensembles.sklearn_interface import AutoTabPFNClassifier
 from sklearn.model_selection import train_test_split
-from itertabpfn.pre_validation import check_target_cols, cast_target_cols
+from itertabpfn.iter.pre_validation import check_target_cols, cast_target_cols
 
 
 
