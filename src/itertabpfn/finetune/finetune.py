@@ -4,15 +4,14 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from typing import Literal
-from copy import deepcopy
 import optuna
 import torch
-import torch.nn.functional as F
-from tabpfn.base import load_model_criterion_config
-from tabpfn.model.transformer import PerFeatureTransformer
 import torch.optim as optim
 from torch import GradScaler
 from torch.utils.data import TensorDataset, DataLoader
+from torch.nn.utils import clip_grad_norm_
+from tabpfn.base import load_model_criterion_config
+from tabpfn.model.transformer import PerFeatureTransformer
 from itertabpfn.finetune.adaptive_early_stopping import AdaptiveEarlyStopping
 from itertabpfn.finetune.model_utils import save_model
 from sklearn.model_selection import train_test_split
@@ -63,13 +62,15 @@ class OptFineTuneTabpfn:
     max_patience (int): The maximum value of patience.
     time_limit (int): Maximum time in seconds after which the fine tuning process is stopped.
     max_steps (int): Maximum number of learning step.
-    use_autocast: bool, True if the GPU is available and False otherwise.
-        Enable mized precision training (stable only on the GPU).
     
-    scaler: instance of the GradScaler class. Apply scaling (and then unscaling) to gradients only in case autocast is True.
-    model: tabpfn classifier. Its loading is resolved by a tabpfn base utility.
-    criterion: instance of CrossEntropyLoss class since only tabpfn classifiers are used.
-    checkpoint_config: object containing metadata of the loaded tabpfn classifier.
+    use_autocast (bool): True if the GPU is available and False otherwise.
+        Enable mized precision training (stable only on the GPU).
+    n_classes (int): Number of classes determined by the number of different labels of the y training set.
+    trials_reports (list[list]): Reports info about the fine tuning process for every trials.
+        This are ordered in increasing order (from trial 0 to N). 
+        Each list reports the total, effective, skipped steps and stop mechanism info in this order.
+    single_report (list): Reports info about the fne tuning process done without HP optimization.
+        The list reports the total, effective, skipped steps and stop mechanism info in this order.
     '''
     def __init__(
         self,
@@ -88,9 +89,8 @@ class OptFineTuneTabpfn:
     ):   
         self._check_data(X_train, y_train, X_val, y_val)
         self.X_train, self.y_train, self.X_val, self.y_val = X_train, y_train, X_val, y_val
-        self.n_classes = len(self.y_train.unique())
         self.path_base_model = path_base_model
-        self.save_path_fine_tuned_model = Path(save_path_fine_tuned_model) if isinstance(save_path_fine_tuned_model, str) else save_path_fine_tuned_model
+        self.save_path_fine_tuned_model: str = str(save_path_fine_tuned_model) if isinstance(save_path_fine_tuned_model, Path) else save_path_fine_tuned_model
         self.min_lr: float = opt_setup.min_lr
         self.max_lr: float = opt_setup.max_lr
         self.min_bs: int = opt_setup.min_bs
@@ -104,11 +104,10 @@ class OptFineTuneTabpfn:
         self.softmax_temperature = softmax_temperature
         self.random_seed = random_seed
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.n_classes = len(self.y_train.unique())
         self.use_autocast = True if self.device == "cuda" else False
-        # self.scaler: GradScaler = None
-        # self.model: PerFeatureTransformer = None
-        # self.criterion: torch.nn.CrossEntropyLoss = None
-        # self.checkpoint_config = None
+        self.trials_reports: list[list] = []
+        self.single_report: list = None
 
 
 
@@ -120,7 +119,7 @@ class OptFineTuneTabpfn:
         '''
         lr = trial.suggest_float("learning_rate", self.min_lr, self.max_lr, log=True)
         batch_size = trial.suggest_int("batch_size", self.min_bs, self.max_bs)
-        best_val_loss = self._fine_tune_tabpfn_clf(lr, batch_size, save=False)
+        best_val_loss = self._fine_tune_tabpfn_clf(lr, batch_size, save=False, report="trials_reports")
         return best_val_loss
 
 
@@ -135,16 +134,33 @@ class OptFineTuneTabpfn:
             filename (str): String reporting the filename.
         Returns: None.
         '''
-        _ = self._fine_tune_tabpfn_clf(learning_rate, batch_size, save=True, filename=filename)
+        _ = self._fine_tune_tabpfn_clf(learning_rate, batch_size, save=True, filename=filename, report="single_report")
         return None
 
 
 
-    def _fine_tune_tabpfn_clf(self, learning_rate: float, batch_size: int, save: bool, filename: str = None) -> float:
+    def _fine_tune_tabpfn_clf(
+            self, 
+            learning_rate: float, 
+            batch_size: int, 
+            report: Literal["trials_reports", "single_report"],
+            save: bool, 
+            filename: str | None = None
+        ) -> float:
         '''
-        Fine tune tabpfn classifier on a single dataset.
-        Interal version to use in the "__call__" method. 
-        Wants in input the HPs values and the indication to save or not the finetuned model.
+        Fine tune a tabpfn classifier on a single dataset.
+        We load the model and set the optimizer and the scaler in order to secure a "fresh" start for every trial.
+        
+        Currently the validation loss is computed using the training set as context.
+        Should we generate a context specific for the validation from the validation set ???
+
+        Parameters:
+            learning rate: learning rate to use.
+            batch_size: batch size to use.
+            report: in which attribute store the report.
+            save: Whether to save or not the finetuned model.
+            filename: The name of the file in which the model is saved. Defaults to None.
+        
         Returns: the best validation loss.
         '''
         if save: 
@@ -186,8 +202,21 @@ class OptFineTuneTabpfn:
 
         while True:
             for X_batch, y_batch in data_loader:
-                X_batch_train, X_batch_test, y_batch_train, y_batch_test = train_test_split(X_batch, y_batch, test_size=0.3, random_state=self.random_seed)
-                train_batch_x, train_batch_y, test_batch_x, test_batch_y= self._prepare_data_to_forward(X_batch_train, y_batch_train, X_batch_test, y_batch_test)
+                
+                y_unique, y_counts = y_batch.unique(return_counts=True)
+                statify = y_batch
+                if y_unique.shape[0] == 1 or 1 in y_counts:
+                    statify = None
+                
+                train_batch_x, test_batch_x, train_batch_y, test_batch_y = self._prepare_data_to_forward(
+                    *train_test_split(
+                        X_batch, 
+                        y_batch, 
+                        test_size=0.3, 
+                        random_state=self.random_seed, 
+                        stratify=statify
+                    )
+                )
 
                 if self.device == "cuda":
                     train_batch_x = train_batch_x.to(device="cuda")
@@ -200,10 +229,11 @@ class OptFineTuneTabpfn:
                 
                 with torch.autocast(device_type=self.device, enabled=self.use_autocast):
                     loss = self._forward_step(model, criterion, train_batch_x, train_batch_y, test_batch_x, test_batch_y) 
-                    
+                
+                # scaling and clipping
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                ### clipping (TOIMPLEMENT)
+                clip_grad_norm_(model.parameters(), max_norm=1, error_if_nonfinite=False)
                 scaler.step(optimizer)
                 
                 ori_scale = scaler.get_scale()
@@ -223,7 +253,6 @@ class OptFineTuneTabpfn:
                     model.eval()
                     updated_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
                     
-
                 # AES and stopping logic
                 if step_with_update and updated_val_loss < best_val_loss:
                     best_val_loss = updated_val_loss
@@ -235,18 +264,19 @@ class OptFineTuneTabpfn:
                 else:
                     residual_patience = aes.get_remaining_patience(effective_steps)
                     if residual_patience <= 0:
+                        self._get_finetune_report(total_steps, effective_steps, skipped_steps, "patience termination", report)
                         return best_val_loss
                 
                 # other stopping logic
                 elapsed_time = time.time() - start_time
                 
                 if elapsed_time >= self.time_limit:
+                    self._get_finetune_report(total_steps, effective_steps, skipped_steps, "time termination", report)
                     return best_val_loss
                 
                 if total_steps == self.max_steps:
+                    self._get_finetune_report(total_steps, effective_steps, skipped_steps, "steps termination", report)
                     return best_val_loss
-
-
 
 
 
@@ -312,6 +342,7 @@ class OptFineTuneTabpfn:
         )
 
 
+
     @staticmethod
     def _check_data(X_train, y_train, X_val, y_val) -> None:
         '''Check input data types.'''
@@ -326,8 +357,8 @@ class OptFineTuneTabpfn:
 
     def _prepare_data_loader(self, batch_size: int, generator: torch.Generator) -> DataLoader:
         '''
-        Prepares the training data loader.
-        Wants in input the batch size and the generator instance.
+        Prepares the training data loader. Wants in input the batch size and the generator instance.
+        Drops partial batches in order to not "consume" (eventually) steps when the context window is reduced.
         Returns: The DataLoader instance.
         '''
         X = torch.tensor(self.X_train.to_numpy(), dtype=torch.float32)
@@ -361,5 +392,38 @@ class OptFineTuneTabpfn:
     
 
 
+    def _get_finetune_report(
+            self,
+            total_steps: int,
+            effective_steps: int, 
+            skipped_steps: int, 
+            stop_mechanisms: str, 
+            where: Literal["trials_reports", "single_report"]
+        ) -> None:
+        '''
+        Get a report about the finetuning process.
+        This is stored in the "single_report" attribute if where equal to "single_report",
+        otherwise in the "trials_reports" attribute.
+        Returns: None
+        '''
+        info = [total_steps, effective_steps, skipped_steps, stop_mechanisms]
+        if where == "trials_reports":
+            self.trials_reports.append(info)
+        else:
+            self.single_report = info
 
 
+
+    def get_df_trials_reports(self) -> pd.DataFrame:
+        '''
+        Organize the trials reports in a panadas dataframe. 
+        Note this is returned and not stored in place.
+        Returns: The dataframe or None if no trial information is available.
+        '''
+        if self.trials_reports:
+            index=["trial" + str(i) for i in range(len(self.trials_reports))]
+            return pd.DataFrame(
+                self.trials_reports, 
+                index=index,
+                columns=["total_steps", "effective_steps", "skipped_steps", "stop_mechanisms"]
+            )
