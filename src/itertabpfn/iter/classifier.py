@@ -11,12 +11,12 @@ from itertabpfn.iter.pre_validation import check_target_cols, cast_target_cols
 
 class IterTabPFNClassifier(BaseModel):
     '''
-    Class to iterate TabPFNClassifier inference to multiple datasets with different configurations.
-    simple_register and ensemble_register attributes are dictionaries used to track already processed 
+    Class to repeat the inference process wuth a TabPFNClassifier on multiple datasets with different configurations.
+    "simple_register" and "ensemble_register" attributes are dictionaries used to track already processed 
     configurations for each dataset for "simple" and "ensemble" classifier types.
     Each dictionary key correspond to a dataset and each entry contains a dict of two lists:
-    Context Sizes: A list of context_size values utilized with "context_size" key.
-    Random States: A list of random_state values utilized with "random_state" key.
+    context sizes: a list of context size values utilized with "context_size" key.
+    random states: a list of random state values utilized with "random_state" key.
     The corresponding positions in these two lists represent combinations of values (aka configurations) 
     that have already been processed.
 
@@ -162,18 +162,18 @@ class IterTabPFNClassifier(BaseModel):
     @validate_call
     def predict(self, types: list[Literal["simple", "ensemble"]]) -> None:
         '''
-        Perform predictions for specified classifier type(s) on all unprocessed configurations.
+        Perform predictions with the setted classifiers on all unprocessed configurations.
         A configuration is a unique combination of (dataset, context_size, random_state).
         The original fit tabpfn method is solely used to pass the input data since ICL does not involve real training.
-        However for ensemble methods a learning phase on the training set (SHOULD be the one passed as context otherwise --> TO CHECK)
+        However for ensemble methods a learning phase on the training set (SHOULD be the one passed as context --> TO CHECK)
         is done in order to learn the ensemble. 
-        Either the case in this implementation traditional fit and predict methods are merged into this single one. 
+        Either the case in this implementation the traditional fit and predict methods are merged into this single one. 
         The predictions consists in both "raw" labels and probability estimates. In addition also the true labels
-        and the number of samples for each class starting from the 0 encoded class and going up are reported.
-        All this info is added to a single dataframe (see attribute "pred_dataframe").
+        and the number of samples for each class, starting from the 0 encoded class going up, are reported.
+        All this info is inserted into a single dataframe (see attribute "pred_dataframe").
         Parameters: 
-            types (list[Literal["simple", "ensemble"]]): 
-                list with at least one of the two possible strings "simple" and "ensemble". It muset be always a list.
+            types (list[Literal["simple", "ensemble"]]): List with at least one of the two possible strings "simple" and "ensemble". 
+                It must be always a list.
         Returns: None       
         '''
         self._validate_classifiers_presence(types)

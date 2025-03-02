@@ -1,5 +1,5 @@
-from itertabpfn.finetune.finetune import OptFineTuneTabpfn
+from itertabpfn.finetune.finetune import OptFineTuneTabPFN
 from itertabpfn.finetune.setup import OptSetup, FineTuneSetup
 
 
-__all__ = ["OptFineTuneTabpfn", "OptSetup", "FineTuneSetup"]
+__all__ = ["OptFineTuneTabPFN", "OptSetup", "FineTuneSetup"]

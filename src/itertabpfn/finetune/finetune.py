@@ -20,7 +20,7 @@ from itertabpfn.finetune.setup import FineTuneSetup, OptSetup
 
 
 
-class OptFineTuneTabpfn:
+class OptFineTuneTabPFN:
     '''
     This class implements a fine-tuning strategy for tabpfn classifiers using AES, with hyperparameter optimization.
     The procedure is designed to work with a single dataframe.
@@ -38,15 +38,14 @@ class OptFineTuneTabpfn:
     Parameters:
         path_base_model (str | Path | Literal["auto"], optional): 
             Path to the base tabpfn model. Defaults to "auto", in which case the model is founded automatically using tabpfn utilities.
-        save_path_fine_tuned_model (str | Path | None): Location where to save the finetuned model.
-            Leave as None if only HPO works has to be done, since the underlying models cannot be saved.
         X_train (pd.DataFrame): training pandas dataframe.
         y_train (pd.Series): training target series.
         X_val (pd.DataFrame): validation pandas dataframe.
         y_val (pd.Series): validation target series.
         fine_tune_setup (FineTuneSetup): FineTuneSetup instance with the finetune directivies.
         opt_setup (OptSetup): OptSetup instance containing the optimization directivies. 
-        softmax_temperature (float, optional): Number between 0 and 1.
+        softmax_temperature (float, optional): Number between 0 and 1. 
+            Defaults to 0.9 which is the default used by tabpfn classifier. 
         random_seed (int, optional): Seed that control the randomness for all the processed involved. Defaults to 50.
         device (Literal["auto"], optional): Search automaticaly for the GPU falling otherwise on the CPU.
         
@@ -78,21 +77,19 @@ class OptFineTuneTabpfn:
         self,
         *,
         path_base_model: str | Path | Literal["auto"] = "auto",
-        save_path_fine_tuned_model: str | Path | None, 
         X_train: pd.DataFrame,
         y_train: pd.Series,
         X_val: pd.DataFrame, 
         y_val: pd.Series, 
         fine_tune_setup: FineTuneSetup,
         opt_setup: OptSetup,
-        softmax_temperature: float = 1,
+        softmax_temperature: float = 0.9,
         random_seed: int = 50, 
         device: Literal["auto"] = "auto"
     ):   
         self._check_data(X_train, y_train, X_val, y_val)
         self.X_train, self.y_train, self.X_val, self.y_val = X_train, y_train, X_val, y_val
         self.path_base_model = path_base_model
-        self.save_path_fine_tuned_model: str = str(save_path_fine_tuned_model) if isinstance(save_path_fine_tuned_model, Path) else save_path_fine_tuned_model
         self.min_lr: float = opt_setup.min_lr
         self.max_lr: float = opt_setup.max_lr
         self.min_bs: int = opt_setup.min_bs
@@ -108,6 +105,7 @@ class OptFineTuneTabpfn:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.n_classes = len(self.y_train.unique())
         self.use_autocast = True if self.device == "cuda" else False
+        self.save_path_fine_tuned_model: str = None
         self.trials_reports: list[list] = []
         self.single_report: list = None
 
@@ -121,22 +119,22 @@ class OptFineTuneTabpfn:
         '''
         lr = trial.suggest_float("learning_rate", self.min_lr, self.max_lr, log=True)
         batch_size = trial.suggest_int("batch_size", self.min_bs, self.max_bs)
-        best_val_loss = self._fine_tune_tabpfn_clf(lr, batch_size, save=False, report="trials_reports")
+        best_val_loss = self._fine_tune_tabpfn_clf(lr, batch_size, file=None, report="trials_reports")
         return best_val_loss
 
 
 
-    def fine_tune_tabpfn_clf(self, learning_rate: float, batch_size: int, filename: str) -> None:
+    def fine_tune_tabpfn_clf(self, learning_rate: float, batch_size: int, file: str | None) -> None:
         '''
-        Fine tune tabpfn classifier on a single dataset with custom learning rate and batch size values.
-        Saves the finetuned model at the location specified in "__init__".
+        Fine tune the tabpfn classifier on the data passed in "__init__" method with specific learning rate and batch size values.
         Parameters:
             learning_rate (float): Learning rate to use.
             batch_size (int): Batch size to use.
-            filename (str): String reporting the filename.
+            file (str | None): String reporting the filepath (path + filename) to which the model is saved.
+                If None the model is not saved.
         Returns: None.
         '''
-        _ = self._fine_tune_tabpfn_clf(learning_rate, batch_size, save=True, filename=filename, report="single_report")
+        _ = self._fine_tune_tabpfn_clf(learning_rate, batch_size, file=file, report="single_report")
         return None
 
 
@@ -146,8 +144,7 @@ class OptFineTuneTabpfn:
             learning_rate: float, 
             batch_size: int, 
             report: Literal["trials_reports", "single_report"],
-            save: bool, 
-            filename: str | None = None
+            file: str | None = None
         ) -> float:
         '''
         Fine tune a tabpfn classifier on a single dataset.
@@ -159,15 +156,11 @@ class OptFineTuneTabpfn:
         Parameters:
             learning rate: learning rate to use.
             batch_size: batch size to use.
-            report: in which attribute store the report.
-            save: Whether to save or not the finetuned model.
-            filename: The name of the file in which the model is saved. Defaults to None.
+            report: indicates in  which attribute to store the report.
+            file: The filepath in which the model is saved. If None, the default, the model is not saved.
         
         Returns: the best validation loss.
-        '''
-        if save: 
-            filepath = os.path.join(self.save_path_fine_tuned_model, filename)
-        
+        '''       
         scaler = GradScaler(device=self.device, growth_interval=100, enabled=self.use_autocast)
         model, criterion, checkpoint_config = self._load_model_criterion_config()
         checkpoint_config = checkpoint_config.__dict__
@@ -180,7 +173,7 @@ class OptFineTuneTabpfn:
             train_x = train_x.to(device="cuda")
             train_y = train_y.to(device="cuda")
             val_x = val_x.to(device="cuda")
-            val_y = val_x.to(device="cuda")
+            val_y = val_y.to(device="cuda")
 
         torch_rng = torch.Generator(self.device).manual_seed(self.random_seed)
         data_loader = self._prepare_data_loader(batch_size, torch_rng)
@@ -194,8 +187,8 @@ class OptFineTuneTabpfn:
         best_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
 
         # saving the base model since its the best right now
-        if save:
-            save_model(model, filepath, checkpoint_config)
+        if file is not None:
+            save_model(model, file, checkpoint_config)
 
         # start training
         total_steps = 0
@@ -255,21 +248,20 @@ class OptFineTuneTabpfn:
                     model.eval()
                     updated_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
                     
-                # AES and stopping logic
+                # stopping logics
                 if step_with_update and updated_val_loss < best_val_loss:
                     best_val_loss = updated_val_loss
                     aes.set_best_round(effective_steps)
                     aes.update_patience()
                     # overwriting the model with the best one
-                    if save: 
-                        save_model(model, filepath, checkpoint_config)
+                    if file is not None: 
+                        save_model(model, file, checkpoint_config)
                 else:
                     residual_patience = aes.get_remaining_patience(effective_steps)
                     if residual_patience <= 0:
                         self._get_finetune_report(total_steps, effective_steps, skipped_steps, "patience termination", report)
                         return best_val_loss
                 
-                # other stopping logic
                 elapsed_time = time.time() - start_time
                 
                 if elapsed_time >= self.time_limit:
@@ -297,7 +289,7 @@ class OptFineTuneTabpfn:
         Returns: The loss as a tensor of a single scalar.
         '''
         pred_logits = model(train_x=train_x, train_y=train_y, test_x=test_x)
-        # not squeezing the first dimension to accomodate case of single test sample
+        # not squeezing the first dimension to accomodate single sample cases
         pred_logits = pred_logits.squeeze(dim=1)[:, :self.n_classes]
         test_y = test_y.squeeze(dim=(1, 2)).long()
         if self.softmax_temperature is not None:
@@ -418,8 +410,8 @@ class OptFineTuneTabpfn:
 
     def get_df_trials_reports(self) -> pd.DataFrame | None:
         '''
-        Organize the trials reports in a pandas DataFrame.
-        Note the dataframe is returned and not stored in place.
+        Organize the trials reports ("trials_reports" property) in a pandas DataFrame.
+        Note the dataframe is returned and not stored in the object.
         Returns: The dataframe or None if no trial information is available.
         '''
         if self.trials_reports:
