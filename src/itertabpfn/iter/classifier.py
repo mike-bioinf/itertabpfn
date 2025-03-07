@@ -27,7 +27,7 @@ class IterTabPFNClassifier(BaseModel):
         context_sizes (set[float]): 
             A set of floats representing the context sizes precentages to be used during inference. 
             If multiple values are provided, all combinations with the random states values are tried.
-            This must always be a set, even if it contains only a single value.
+            Must be always a set even if one value is passed.
         random_states (set[int]): 
             Set of integers indicating the seeds to use. 
             If multiple values are provided, all combinations with the context size values are tried.
@@ -147,7 +147,7 @@ class IterTabPFNClassifier(BaseModel):
 
 
     def _apply_modify(self, new_values: set, mode: Literal["add", "remove", "replace"], property: Literal["context_sizes", "random_states"]):
-        '''Helper to control the type fo modification done to context_sizes and random_states attributes'''
+        '''Helper to control the type of modification done to context_sizes and random_states attributes'''
         old_values = self.context_sizes if property == "context_sizes" else self.random_states
         if mode == "add":
             final_values = old_values | new_values

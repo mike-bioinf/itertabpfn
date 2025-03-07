@@ -42,7 +42,7 @@ class FineTuneSetup:
 def get_minmax_batch_sizes(array: np.ndarray | pd.DataFrame | pd.Series) -> tuple[int, int]:
     '''
     Retrieve the minimum and maximum batch sizes to try in a HPO process based on euristics.
-    The function takes in input both 2D ans 1D data structure. 
+    The function takes in input both 2D and 1D data structure. 
     In the first case the 0 dimension is used to determine the number of samples.
     Parameters:
         array (np.ndarray | pd.DataFrame | pd.Series): array-like structure from which the number of samples is inferred.
