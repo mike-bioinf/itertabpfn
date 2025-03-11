@@ -10,12 +10,13 @@ import torch.optim as optim
 from torch import GradScaler
 from torch.utils.data import TensorDataset, DataLoader
 from torch.nn.utils import clip_grad_norm_
+from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 from tabpfn.base import load_model_criterion_config
 from tabpfn.model.transformer import PerFeatureTransformer
 from itertabpfn.finetune.adaptive_early_stopping import AdaptiveEarlyStopping
 from itertabpfn.finetune.model_utils import save_model
+from itertabpfn.finetune.setup import FineTuneSetup, OptSetup, infer_time_limit
 from sklearn.model_selection import train_test_split
-from itertabpfn.finetune.setup import FineTuneSetup, OptSetup
 # from schedulefree import AdamWScheduleFree
 
 
@@ -44,7 +45,8 @@ class OptFineTuneTabPFN:
         y_val (pd.Series): validation target series.
         fine_tune_setup (FineTuneSetup): FineTuneSetup instance with the finetune directivies.
         opt_setup (OptSetup): OptSetup instance containing the optimization directivies. 
-        softmax_temperature (float | None, optional): Number that divides the raw logits if not None. 
+        softmax_temperature (float | None, optional): 
+            Number that divides the raw logits in a multiclassification setting if not None. 
             Defaults to 0.9 which is the default used by tabpfn classifiers.  
         random_seed (int, optional): Seed that control the randomness for all the processed involved. Defaults to 50.
         device (Literal["auto"], optional): Search automaticaly for the GPU falling otherwise on the CPU.
@@ -67,10 +69,15 @@ class OptFineTuneTabPFN:
     scaler_setting (dict): Dict with initial scaler settings (are fixed since the scale factor is dinamicaly adapted). 
     
     n_classes (int): Number of classes determined by the number of different labels of the y training set.
+
+    task_type (Literal["binary", "multiclass"]): type of classification problem. 
+        Informs the choice of the cross entropy loss "type" to use.
+
+    loss (BCEWithLogitsLoss | CrossEntropyLoss): "type" of cross entropy loss to use.
+        BCEWithLogitsLoss class if the classification problem is binary otherwise CrossEntropyLoss class.
     
     use_autocast (bool): True if the GPU is available and False otherwise.
         Enable mixed precision training (stable only on GPU).
-
     
     current_trial (str): Reports the current trial when __call__ is called. String like "trial1".
     
@@ -87,6 +94,9 @@ class OptFineTuneTabPFN:
     
     single_report_scaler (list[list]): Reports the scaler info during a single non optimized finetune process.
         Each sublist contains info about a learning step. They are organized from step 1 to total_steps.
+
+    single_report_val_loss (list): Reports the validation loss values registered during the finetuning process.
+        Only the values for the effective steps are considered.  
     '''
     def __init__(
         self,
@@ -113,17 +123,19 @@ class OptFineTuneTabPFN:
         self.adaptive_offset: float = fine_tune_setup.adaptive_offset
         self.min_patience: int = fine_tune_setup.min_patience
         self.max_patience: int = fine_tune_setup.max_patience
-        self.time_limit: float = fine_tune_setup.time_limit
+        self.time_limit: float = infer_time_limit(X_train) if fine_tune_setup.time_limit == "infer" else fine_tune_setup.time_limit
         self.max_steps: int = fine_tune_setup.max_steps
         self.softmax_temperature = softmax_temperature
         self.random_seed = random_seed
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.n_classes = len(self.y_train.unique())
+        self.task_type = "binary" if self.n_classes == 2 else "multiclass"
+        self.Loss = BCEWithLogitsLoss if self.task_type == "binary" else CrossEntropyLoss
         self.use_autocast = True if self.device == "cuda" else False
         self.save_path_fine_tuned_model: str = None
         
         self.scaler_settings = {
-            "init_scale": 2 ** 16,
+            "init_scale": 2 ** 20,
             "growth_factor": 2, 
             "backoff_factor": 0.5,
             "growth_interval": 100
@@ -134,6 +146,8 @@ class OptFineTuneTabPFN:
         self.trials_reports_scaler: dict[str, list[list]] = {}
         self.single_report_aes: list = []
         self.single_report_scaler: list = []
+        self.single_report_val_loss: list = []
+
 
 
 
@@ -146,7 +160,7 @@ class OptFineTuneTabPFN:
         self.current_trial = "trial" + str(trial.number)
         lr = trial.suggest_float("learning_rate", self.min_lr, self.max_lr, log=True)
         batch_size = trial.suggest_int("batch_size", self.min_bs, self.max_bs)
-        best_val_loss = self._fine_tune_tabpfn_clf(lr, batch_size, file=None, report="trials")
+        best_val_loss = self._fine_tune_tabpfn_clf(lr, batch_size, file=None, report="trials", trial=trial)
         return best_val_loss
 
 
@@ -173,7 +187,8 @@ class OptFineTuneTabPFN:
             learning_rate: float, 
             batch_size: int, 
             report: Literal["trials", "single"],
-            file: str | None = None
+            file: str | None = None,
+            trial: optuna.Trial | None = None
         ) -> float:
         '''
         Fine tune a tabpfn classifier on a single dataset.
@@ -187,40 +202,28 @@ class OptFineTuneTabPFN:
             batch_size: batch size to use.
             report: Hints in which attributes to store the aes and scaler reports.
             file: The filepath in which the model is saved. If None, the default, the model is not saved.
+            trial: Trail object passed in the optimization scenario.
         
         Returns: the best validation loss.
         '''
-        scaler = GradScaler(
-            device=self.device,
-            init_scale=self.scaler_settings["init_scale"],
-            growth_factor=self.scaler_settings["growth_factor"],
-            backoff_factor=self.scaler_settings["backoff_factor"],
-            growth_interval=self.scaler_settings["growth_interval"],
-            enabled=self.use_autocast
+        model, checkpoint_config, criterion, scaler, aes = self._setup_training()
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+        
+        train_x, train_y, val_x, val_y = self._prepare_data_to_forward(
+            self.X_train, self.y_train, self.X_val, self.y_val
         )
         
-        model, criterion, checkpoint_config = self._load_model_criterion_config()
-        checkpoint_config = checkpoint_config.__dict__
-
-        aes = AdaptiveEarlyStopping(self.adaptive_rate, self.adaptive_offset, self.min_patience, self.max_patience)
-        train_x, train_y, val_x, val_y = self._prepare_data_to_forward(self.X_train, self.y_train, self.X_val, self.y_val)
-        
-        if self.device == "cuda": 
+        if self.device == "cuda":
             model = model.to(device="cuda")
             train_x = train_x.to(device="cuda")
             train_y = train_y.to(device="cuda")
             val_x = val_x.to(device="cuda")
             val_y = val_y.to(device="cuda")
 
-        
-        loader_rng = torch.Generator("cpu").manual_seed(self.random_seed)
-        data_loader = self._prepare_data_loader(batch_size, loader_rng)
-        optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+        data_loader = self._create_data_loader(batch_size)
 
-        # starting time counter
+        # start finetune process
         start_time = time.time()
-        
-        # setting base-model val loss
         model.eval()
         best_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
 
@@ -234,45 +237,24 @@ class OptFineTuneTabPFN:
 
         while True:
             for X_batch, y_batch in data_loader:
-
                 total_steps += 1
-                y_unique, y_counts = y_batch.unique(return_counts=True)
-                statify = y_batch
+                train_batch_x, train_batch_y, test_batch_x, test_batch_y = self._process_training_batch(X_batch, y_batch)
                 
-                if y_unique.shape[0] == 1 or 1 in y_counts:
-                    statify = None
-                
-                train_batch_x, test_batch_x, train_batch_y, test_batch_y = self._prepare_data_to_forward(
-                    *train_test_split(
-                        X_batch, 
-                        y_batch, 
-                        test_size=0.3, 
-                        random_state=self.random_seed, 
-                        stratify=statify
-                    )
-                )
-
-                if self.device == "cuda":
-                    train_batch_x = train_batch_x.to(device="cuda")
-                    train_batch_y = train_batch_y.to(device="cuda")
-                    test_batch_x = test_batch_x.to(device="cuda")
-                    test_batch_y = test_batch_y.to(device="cuda")
-
                 model.train()
-                
                 with torch.autocast(device_type=self.device, enabled=self.use_autocast):
                     loss = self._forward_step(model, criterion, train_batch_x, train_batch_y, test_batch_x, test_batch_y) 
                 
-                # scaling and clipping
+                # scaling, clipping and updating
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                clip_grad_norm_(model.parameters(), max_norm=1, error_if_nonfinite=False)
+                _ = clip_grad_norm_(model.parameters(), max_norm=1, error_if_nonfinite=False)
                 scaler.step(optimizer)
+                optimizer.zero_grad()
                 
                 ori_scale = scaler.get_scale()
                 scaler.update()
                 updated_scale = scaler.get_scale()
-
+                
                 if self.use_autocast:
                     self._construct_scaler_report(
                         updated_scale,
@@ -283,19 +265,21 @@ class OptFineTuneTabPFN:
                     )
                 
                 if updated_scale < ori_scale:
-                    step_with_scaler_update = False
+                    step_with_update = False
                 else:
                     effective_steps += 1
-                    step_with_scaler_update = True
+                    step_with_update = True
                 
-                optimizer.zero_grad()
-                
-                if step_with_scaler_update:
+                if step_with_update:
                     model.eval()
                     updated_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
-                    
+                    if report == "trials":
+                        trial.report(updated_val_loss, effective_steps)
+                    else:
+                        self.single_report_val_loss.append(best_val_loss)
+
                 # stopping logics
-                if step_with_scaler_update and updated_val_loss < best_val_loss:
+                if step_with_update and updated_val_loss < best_val_loss:
                     best_val_loss = updated_val_loss
                     aes.set_best_round(effective_steps)
                     aes.update_patience()
@@ -319,10 +303,64 @@ class OptFineTuneTabPFN:
                     return best_val_loss
 
 
+
+    def _setup_training(self):
+        '''
+        Setup training components: model, scaler and early stopping.
+        Loads the model spefied in "__init__" using the tabpfn "load_model_criterion_config" utility.
+        '''
+        path_model = None if self.path_base_model == "auto" else self.path_base_model
+        
+        model, _, checkpoint_config = load_model_criterion_config(
+            model_path=path_model,
+            check_bar_distribution_criterion=False,
+            cache_trainset_representation=False,
+            which="classifier",
+            download=True,
+            version="v2",
+            model_seed=self.random_seed
+        )
+
+        checkpoint_config = checkpoint_config.__dict__
+        criterion = self.Loss(reduction="none")
+        
+        scaler = GradScaler(
+            device=self.device,
+            init_scale=self.scaler_settings["init_scale"],
+            growth_factor=self.scaler_settings["growth_factor"],
+            backoff_factor=self.scaler_settings["backoff_factor"],
+            growth_interval=self.scaler_settings["growth_interval"],
+            enabled=self.use_autocast
+        )
+        
+        aes = AdaptiveEarlyStopping(
+            self.adaptive_rate, 
+            self.adaptive_offset, 
+            self.min_patience, 
+            self.max_patience
+        )
+
+        return model, checkpoint_config, criterion, scaler, aes
+
+
+
+    def _create_data_loader(self, batch_size: int) -> DataLoader:
+        '''
+        Create and return the data loader for training.
+        Drops partial batches in order to not "consume" (eventually) in the aes procedure
+        training steps when the context window is reduced.
+        '''
+        X = torch.tensor(self.X_train.to_numpy(), dtype=torch.float32)
+        y = torch.tensor(self.y_train.to_numpy(), dtype=torch.float32)
+        loader_rng = torch.Generator("cpu").manual_seed(self.random_seed)
+        return DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=True, generator=loader_rng, drop_last=True)
+
+
+
     def _forward_step(
             self,
             model: PerFeatureTransformer,
-            criterion: torch.nn.CrossEntropyLoss,
+            criterion: BCEWithLogitsLoss | CrossEntropyLoss,
             train_x: torch.Tensor,   # (n_samples, 1, n_features)
             train_y: torch.Tensor,  # (n_samples, 1, 1)
             test_x: torch.Tensor,   # (n_samples, 1, n_features)
@@ -330,15 +368,23 @@ class OptFineTuneTabPFN:
         ) -> torch.Tensor:
         '''
         Perform the forward pass.
-        Needs the context and test tensors.
+        Needs the crtierion, context and test tensors.
         Returns: The loss as a tensor of a single scalar.
         '''
         pred_logits = model(train_x=train_x, train_y=train_y, test_x=test_x)
-        # not squeezing the 0 dimension to accomodate single sample cases
-        pred_logits = pred_logits.squeeze(dim=1)[:, :self.n_classes] 
-        test_y = test_y.squeeze(dim=(1, 2)).long()
-        if self.softmax_temperature is not None:
-            pred_logits = pred_logits / self.softmax_temperature
+        # squeezing dimension 1 since we work always with a single batch
+        pred_logits = pred_logits.squeeze(dim=1)
+
+        if self.task_type == "multiclass":
+            test_y = test_y.flatten().long()
+            pred_logits = pred_logits[:, :self.n_classes]
+            if self.softmax_temperature is not None:
+                pred_logits = pred_logits / self.softmax_temperature
+        else:
+            # select positive class logits only
+            pred_logits = pred_logits[:, 1]
+            test_y = test_y.squeeze(dim=1).float()
+                
         loss = criterion(pred_logits, test_y).mean()
         return loss
     
@@ -347,7 +393,7 @@ class OptFineTuneTabPFN:
     def _forward_validation_step(
             self,
             model: PerFeatureTransformer,
-            criterion: torch.nn.CrossEntropyLoss,
+            criterion: BCEWithLogitsLoss | CrossEntropyLoss,
             train_x: torch.Tensor,
             train_y: torch.Tensor,
             test_x: torch.Tensor,
@@ -364,45 +410,31 @@ class OptFineTuneTabPFN:
 
 
 
-    def _load_model_criterion_config(self) -> tuple:
+    def _process_training_batch(self, X_batch: torch.Tensor, y_batch: torch.Tensor) -> tuple[torch.Tensor]:
         '''
-        Loads the model spefied in "__init__" using the tabpfn "load_model_criterion_config" utility.
-        Returns: The model, the criterion (CrossEntropy torch class instance) and the model configuration (contains metadata).
+        Process a training batch and prepare it for the forward pass.
+        Returns: The x and y train and test batch sets.
         '''
-        path_model = None if self.path_base_model == "auto" else self.path_base_model
-        return load_model_criterion_config(
-            model_path=path_model,
-            check_bar_distribution_criterion=False,
-            cache_trainset_representation=False,
-            which="classifier",
-            download=True,
-            version="v2",
-            model_seed=self.random_seed
+        y_unique, y_counts = y_batch.unique(return_counts=True)
+        stratify = y_batch if y_unique.shape[0] > 1 and 1 not in y_counts else None
+        
+        train_batch_x, test_batch_x, train_batch_y, test_batch_y = self._prepare_data_to_forward(
+            *train_test_split(
+                X_batch, 
+                y_batch, 
+                test_size=0.3, 
+                random_state=self.random_seed, 
+                stratify=stratify
+            )
         )
 
-
-
-    @staticmethod
-    def _check_data(X_train, y_train, X_val, y_val) -> None:
-        '''Check input data types.'''
-        for x_data in [X_train, X_val]:
-            if not isinstance(x_data, pd.DataFrame):
-                raise TypeError("X_train and X_val must be pandas DataFrame objects")
-        for y_data in [y_train, y_val]:
-            if not isinstance(y_data, pd.Series):
-                raise TypeError("y_train and y_val must be pandas Series objects")
-
-
-
-    def _prepare_data_loader(self, batch_size: int, generator: torch.Generator) -> DataLoader:
-        '''
-        Prepares the training data loader. Wants in input the batch size and the generator instance.
-        Drops partial batches in order to not "consume" (eventually) steps when the context window is reduced.
-        Returns: The DataLoader instance.
-        '''
-        X = torch.tensor(self.X_train.to_numpy(), dtype=torch.float32)
-        y = torch.tensor(self.y_train.to_numpy(), dtype=torch.float32)
-        return DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=True, generator=generator, drop_last=True)
+        if self.device == "cuda":
+            train_batch_x = train_batch_x.to(device="cuda")
+            train_batch_y = train_batch_y.to(device="cuda")
+            test_batch_x = test_batch_x.to(device="cuda")
+            test_batch_y = test_batch_y.to(device="cuda")
+            
+        return train_batch_x, train_batch_y, test_batch_x, test_batch_y
 
 
 
@@ -428,7 +460,20 @@ class OptFineTuneTabPFN:
                 tensor = torch.tensor(data, dtype=torch.float32).reshape((-1, 1, 1))
             tensors.append(tensor)
         return tensors
-    
+
+
+
+    @staticmethod
+    def _check_data(X_train, y_train, X_val, y_val) -> None:
+        '''Check input data types.'''
+        for x_data in [X_train, X_val]:
+            if not isinstance(x_data, pd.DataFrame):
+                raise TypeError("X_train and X_val must be pandas DataFrame objects")
+        for y_data in [y_train, y_val]:
+            if not isinstance(y_data, pd.Series):
+                raise TypeError("y_train and y_val must be pandas Series objects")
+
+
 
 
     def _construct_finetune_report(
@@ -545,4 +590,4 @@ class OptFineTuneTabPFN:
         Helps to generate a single scaler dataframe report taking the list with the step lists info. 
         '''
         index = ["step" + str(i) for i in range(0, len(list_report))]
-        return pd.DataFrame(data=list_report, index=index, columns=["scale_factor", "backoff_factor", "growth_interval"])
+        return pd.DataFrame(data=list_report, index=index, columns=["scale_factor", "growth_factor", "backoff_factor", "growth_interval"])
