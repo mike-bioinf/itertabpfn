@@ -1,14 +1,14 @@
-import os
 import time
+import logging
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Generator
+from sklearn.model_selection import train_test_split, StratifiedKFold
 import optuna
 import torch
 import torch.optim as optim
 from torch import GradScaler
-from torch.utils.data import TensorDataset, DataLoader
 from torch.nn.utils import clip_grad_norm_
 from torch.nn import CrossEntropyLoss, BCEWithLogitsLoss
 from tabpfn.base import load_model_criterion_config
@@ -16,7 +16,7 @@ from tabpfn.model.transformer import PerFeatureTransformer
 from itertabpfn.finetune.adaptive_early_stopping import AdaptiveEarlyStopping
 from itertabpfn.finetune.model_utils import save_model
 from itertabpfn.finetune.setup import FineTuneSetup, OptSetup, infer_time_limit
-from sklearn.model_selection import train_test_split
+from itertabpfn.finetune.report import *
 # from schedulefree import AdamWScheduleFree
 
 
@@ -32,8 +32,8 @@ class OptFineTuneTabPFN:
     
     The fine-tuning procedure implements three stopping logic:
         1) early stopping on training time;
-        2) AES;
-        3) Number of training steps. 
+        2) adaptive early stopping;
+        3) number of training steps. 
         
     ----------
     Parameters:
@@ -44,7 +44,8 @@ class OptFineTuneTabPFN:
         X_val (pd.DataFrame): validation pandas dataframe.
         y_val (pd.Series): validation target series.
         fine_tune_setup (FineTuneSetup): FineTuneSetup instance with the finetune directivies.
-        opt_setup (OptSetup): OptSetup instance containing the optimization directivies. 
+        opt_setup (OptSetup | None): OptSetup instance containing the optimization directivies, 
+            or None if no optimization is involved.
         softmax_temperature (float | None, optional): 
             Number that divides the raw logits in a multiclassification setting if not None. 
             Defaults to 0.9 which is the default used by tabpfn classifiers.  
@@ -54,19 +55,21 @@ class OptFineTuneTabPFN:
     ----------
     Attributes:
 
-    min_lr (float): The inferior limit for the learning_rate searchable range.
-    max_lr (float): The superior limit for the learning_rate searchable range.
-    min_bs (int): The inferior limit for the batch_size searchable range.
-    max_bs (int): The superior limit for the batch_size searchable range.
+    opts (OptSetup | None): data instance with the following attributes:
+        min_lr (float): The inferior limit for the learning_rate searchable range.
+        max_lr (float): The superior limit for the learning_rate searchable range.
+        min_bs (int): The inferior limit for the batch_size searchable range.
+        max_bs (int): The superior limit for the batch_size searchable range.
+
+    fts (FineTuneSetup): data instance with the following attributes:   
+        adaptive_rate (float): The rate of increase in patience.
+        adaptive_offset (int): The initial patience at round 0.
+        min_patience (int): The minimum value of patience.
+        max_patience (int): The maximum value of patience.
+        time_limit (int): Maximum time in seconds after which the fine tuning process is stopped.
+        max_steps (int): Maximum number of learning step.
     
-    adaptive_rate (float): The rate of increase in patience.
-    adaptive_offset (int): The initial patience at round 0.
-    min_patience (int): The minimum value of patience.
-    max_patience (int): The maximum value of patience.
-    time_limit (int): Maximum time in seconds after which the fine tuning process is stopped.
-    max_steps (int): Maximum number of learning step.
-    
-    scaler_setting (dict): Dict with initial scaler settings (are fixed since the scale factor is dinamicaly adapted). 
+    scaler_setting (dict): Dict with initial scaler settings (are fixed since the scale factor is dinamically adapted). 
     
     n_classes (int): Number of classes determined by the number of different labels of the y training set.
 
@@ -76,8 +79,9 @@ class OptFineTuneTabPFN:
     loss (BCEWithLogitsLoss | CrossEntropyLoss): "type" of cross entropy loss to use.
         BCEWithLogitsLoss class if the classification problem is binary otherwise CrossEntropyLoss class.
     
-    use_autocast (bool): True if the GPU is available and False otherwise.
-        Enable mixed precision training (stable only on GPU).
+    use_autocast (bool): True if the GPU is available and False otherwise. Enable mixed precision training (stable only on GPU).
+
+    logger (logging.Logger): logger instance used to manage logging in the single finetune scenario.
     
     current_trial (str): Reports the current trial when __call__ is called. String like "trial1".
     
@@ -107,7 +111,7 @@ class OptFineTuneTabPFN:
         X_val: pd.DataFrame, 
         y_val: pd.Series, 
         fine_tune_setup: FineTuneSetup,
-        opt_setup: OptSetup,
+        opt_setup: OptSetup | None,
         softmax_temperature: float | None = 0.9,
         random_seed: int = 50, 
         device: Literal["auto"] = "auto"
@@ -115,16 +119,11 @@ class OptFineTuneTabPFN:
         self._check_data(X_train, y_train, X_val, y_val)
         self.X_train, self.y_train, self.X_val, self.y_val = X_train, y_train, X_val, y_val
         self.path_base_model = path_base_model
-        self.min_lr: float = opt_setup.min_lr
-        self.max_lr: float = opt_setup.max_lr
-        self.min_bs: int = opt_setup.min_bs
-        self.max_bs:int = opt_setup.max_bs
-        self.adaptive_rate: float = fine_tune_setup.adaptive_rate
-        self.adaptive_offset: float = fine_tune_setup.adaptive_offset
-        self.min_patience: int = fine_tune_setup.min_patience
-        self.max_patience: int = fine_tune_setup.max_patience
-        self.time_limit: float = infer_time_limit(X_train) if fine_tune_setup.time_limit == "infer" else fine_tune_setup.time_limit
-        self.max_steps: int = fine_tune_setup.max_steps
+        
+        fine_tune_setup.time_limit = infer_time_limit(X_train) if fine_tune_setup.time_limit == "infer" else fine_tune_setup.time_limit
+        self.opts = opt_setup
+        self.fts = fine_tune_setup
+        
         self.softmax_temperature = softmax_temperature
         self.random_seed = random_seed
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -132,7 +131,7 @@ class OptFineTuneTabPFN:
         self.task_type = "binary" if self.n_classes == 2 else "multiclass"
         self.Loss = BCEWithLogitsLoss if self.task_type == "binary" else CrossEntropyLoss
         self.use_autocast = True if self.device == "cuda" else False
-        self.save_path_fine_tuned_model: str = None
+        self.logger: logging.Logger = None
         
         self.scaler_settings = {
             "init_scale": 2 ** 20,
@@ -150,16 +149,16 @@ class OptFineTuneTabPFN:
 
 
 
-
     def __call__(self, trial: optuna.Trial) -> float:
         '''
-        Method called when the 'OptFineTuneTabpfn' instance is passed in the optuna optimizer.
-        The models are currently not saved.
+        Method called when the 'OptFineTuneTabpfn' instance is passed in the optuna optimizer. 
+        The Trial object is automatically passed in input. 
+        The resulting models are currently not saved.
         Returns: The best validation loss.
         '''
         self.current_trial = "trial" + str(trial.number)
-        lr = trial.suggest_float("learning_rate", self.min_lr, self.max_lr, log=True)
-        batch_size = trial.suggest_int("batch_size", self.min_bs, self.max_bs)
+        lr = trial.suggest_float("learning_rate", self.opts.min_lr, self.opts.max_lr, log=True)
+        batch_size = trial.suggest_int("batch_size", self.opts.min_bs, self.opts.max_bs)
         best_val_loss = self._fine_tune_tabpfn_clf(lr, batch_size, file=None, report="trials", trial=trial)
         return best_val_loss
 
@@ -177,6 +176,8 @@ class OptFineTuneTabPFN:
                 Defaults to False.
         Returns: None or the validation loss.
         '''
+        create_logger(self)
+        print(f" ============== Finetuning with learning rate of {learning_rate} and batch size of {batch_size}  ================ \n")
         val_loss = self._fine_tune_tabpfn_clf(learning_rate, batch_size, file=file, report="single")
         if return_val_loss: return val_loss
 
@@ -220,12 +221,13 @@ class OptFineTuneTabPFN:
             val_x = val_x.to(device="cuda")
             val_y = val_y.to(device="cuda")
 
-        data_loader = self._create_data_loader(batch_size)
+        index_loader = self._create_index_loader(batch_size)
 
         # start finetune process
         start_time = time.time()
         model.eval()
-        best_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
+        init_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
+        best_val_loss = init_val_loss
 
         # saving the base model since its the best right now
         if file is not None:
@@ -235,72 +237,89 @@ class OptFineTuneTabPFN:
         total_steps = 0
         effective_steps = 0  
 
-        while True:
-            for X_batch, y_batch in data_loader:
-                total_steps += 1
-                train_batch_x, train_batch_y, test_batch_x, test_batch_y = self._process_training_batch(X_batch, y_batch)
-                
-                model.train()
-                with torch.autocast(device_type=self.device, enabled=self.use_autocast):
-                    loss = self._forward_step(model, criterion, train_batch_x, train_batch_y, test_batch_x, test_batch_y) 
-                
-                # scaling, clipping and updating
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                _ = clip_grad_norm_(model.parameters(), max_norm=1, error_if_nonfinite=False)
-                scaler.step(optimizer)
-                optimizer.zero_grad()
-                
-                ori_scale = scaler.get_scale()
-                scaler.update()
-                updated_scale = scaler.get_scale()
-                
-                if self.use_autocast:
-                    self._construct_scaler_report(
-                        updated_scale,
-                        scaler.get_growth_factor(), 
-                        scaler.get_backoff_factor(), 
-                        scaler.get_growth_interval(), 
-                        report
-                    )
-                
-                if updated_scale < ori_scale:
-                    step_with_update = False
+        for _ , idx_batch in index_loader:
+            total_steps += 1
+            
+            X_batch = self.X_train.iloc[idx_batch, :]
+            y_batch = self.y_train.iloc[idx_batch]
+            train_batch_x, train_batch_y, test_batch_x, test_batch_y = self._process_training_batch(X_batch, y_batch)
+            
+            model.train()
+            with torch.autocast(device_type=self.device, enabled=self.use_autocast):
+                loss = self._forward_step(model, criterion, train_batch_x, train_batch_y, test_batch_x, test_batch_y) 
+            
+            # scaling, clipping and updating
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            _ = clip_grad_norm_(model.parameters(), max_norm=1, error_if_nonfinite=False)
+            scaler.step(optimizer)
+            optimizer.zero_grad()
+            
+            ori_scale = scaler.get_scale()
+            scaler.update()
+            updated_scale = scaler.get_scale()
+            
+            if self.use_autocast:
+                construct_scaler_report(
+                    opt_obj=self,
+                    scale_factor=updated_scale,
+                    growth_factor=scaler.get_growth_factor(), 
+                    backoff_factor=scaler.get_backoff_factor(), 
+                    growth_interval=scaler.get_growth_interval(), 
+                    where=report
+                )
+            
+            if updated_scale < ori_scale:
+                step_with_update = False
+            else:
+                effective_steps += 1
+                step_with_update = True
+            
+            if step_with_update:
+                model.eval()
+                updated_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
+                if report == "trials":
+                    trial.report(updated_val_loss, effective_steps)
                 else:
-                    effective_steps += 1
-                    step_with_update = True
-                
-                if step_with_update:
-                    model.eval()
-                    updated_val_loss = self._forward_validation_step(model, criterion, train_x, train_y, val_x, val_y)
-                    if report == "trials":
-                        trial.report(updated_val_loss, effective_steps)
-                    else:
-                        self.single_report_val_loss.append(best_val_loss)
+                    self.single_report_val_loss.append(best_val_loss)
 
-                # stopping logics
-                if step_with_update and updated_val_loss < best_val_loss:
-                    best_val_loss = updated_val_loss
-                    aes.set_best_round(effective_steps)
-                    aes.update_patience()
-                    # overwriting the model with the best one
-                    if file is not None: 
-                        save_model(model, file, checkpoint_config)
-                else:
-                    residual_patience = aes.get_remaining_patience(effective_steps)
-                    if residual_patience <= 0:
-                        self._construct_finetune_report(total_steps, effective_steps, "patience termination", report)
-                        return best_val_loss
-                
-                elapsed_time = time.time() - start_time
-                
-                if elapsed_time >= self.time_limit:
-                    self._construct_finetune_report(total_steps, effective_steps, "time termination", report)
+            # logging
+            total_time_spent = time.time() - start_time
+            time_remaining = max(0, self.fts.time_limit - total_time_spent)
+
+            self.logger.debug(
+                f"""
+                Step {total_steps}/{self.fts.max_steps}
+                Total Time Spent: '{total_time_spent}'
+                Time remaining: '{time_remaining}'
+                Initial Validation Loss: '{init_val_loss}'
+                Best Validation Loss: '{best_val_loss}'
+                """.replace("\n", "\t")
+            )
+
+            # stopping logics
+            if step_with_update and updated_val_loss < best_val_loss:
+                best_val_loss = updated_val_loss
+                aes.set_best_round(effective_steps)
+                aes.update_patience()
+                # overwriting the model with the new best one
+                if file is not None: 
+                    save_model(model, file, checkpoint_config)
+            else:
+                residual_patience = aes.get_remaining_patience(effective_steps)
+                if residual_patience <= 0:
+                    construct_aes_report(self, total_steps, effective_steps, "patience termination", report)
                     return best_val_loss
-                
-                if total_steps == self.max_steps:
-                    self._construct_finetune_report(total_steps, effective_steps, "steps termination", report)
-                    return best_val_loss
+            
+            elapsed_time = time.time() - start_time
+            
+            if elapsed_time >= self.fts.time_limit:
+                construct_aes_report(self, total_steps, effective_steps, "time termination", report)
+                return best_val_loss
+            
+            if total_steps == self.fts.max_steps:
+                construct_aes_report(self, total_steps, effective_steps, "steps termination", report)
+                return best_val_loss
 
 
 
@@ -334,26 +353,54 @@ class OptFineTuneTabPFN:
         )
         
         aes = AdaptiveEarlyStopping(
-            self.adaptive_rate, 
-            self.adaptive_offset, 
-            self.min_patience, 
-            self.max_patience
+            self.fts.adaptive_rate, 
+            self.fts.adaptive_offset, 
+            self.fts.min_patience, 
+            self.fts.max_patience
         )
 
         return model, checkpoint_config, criterion, scaler, aes
 
 
 
-    def _create_data_loader(self, batch_size: int) -> DataLoader:
+    def _create_index_loader(self, batch_size: int) -> Generator[tuple[int, int], None, None]:
         '''
-        Create and return the data loader for training.
-        Drops partial batches in order to not "consume" (eventually) in the aes procedure
-        training steps when the context window is reduced.
+        Create the "index data loader" for the training process.
+        
+        This loader is NOT a DataLoader object but instead a Generator that yields an endless 
+        stream of train/test stratified split indexes organized in a binary tuple.
+        
+        The designed use for such iterators is to discard the "train" information and take only the "test" idx from which obtain the batch.
+        In this way we can obtain stratified batch of the desired dimensions.
+        
+        Note: to generate batch of the desired dimension we discard some samples. 
+        This is functionaly equivalent to discard partial batches using a standard torch data loader.
+        Such behaviour is justified in the finetune framework since it allows to not "eventually consume" 
+        steps when the context window is reduced in the AES-controlled-training.
         '''
-        X = torch.tensor(self.X_train.to_numpy(), dtype=torch.float32)
-        y = torch.tensor(self.y_train.to_numpy(), dtype=torch.float32)
-        loader_rng = torch.Generator("cpu").manual_seed(self.random_seed)
-        return DataLoader(TensorDataset(X, y), batch_size=batch_size, shuffle=True, generator=loader_rng, drop_last=True)
+        rng_split = np.random.default_rng(self.random_seed)
+        rng_selection = np.random.default_rng(self.random_seed)
+
+        n_samples = self.X_train.shape[0]
+        n_splits = int(n_samples // batch_size)
+        rest = n_samples % batch_size 
+
+        while True:
+            # remove samples to obtain the desired batches dimension
+            # the selection is random and therefore should approximately respect the distribution of classes
+            if rest:
+                idx_to_keep = rng_selection.choice(n_samples, size=n_samples-rest, replace=False, shuffle=True)
+                X_sel = self.X_train.iloc[idx_to_keep, :]
+                y_sel = self.y_train.iloc[idx_to_keep]
+            else:
+                X_sel = self.X_train
+                y_sel = self.y_train
+
+            yield from StratifiedKFold(
+                    n_splits=n_splits,
+                    shuffle=True,
+                    random_state=rng_split.integers(0, np.iinfo(np.int32).max)
+                ).split(X_sel, y_sel)
 
 
 
@@ -410,12 +457,12 @@ class OptFineTuneTabPFN:
 
 
 
-    def _process_training_batch(self, X_batch: torch.Tensor, y_batch: torch.Tensor) -> tuple[torch.Tensor]:
+    def _process_training_batch(self, X_batch: pd.DataFrame, y_batch: pd.Series) -> tuple[torch.Tensor]:
         '''
         Process a training batch and prepare it for the forward pass.
         Returns: The x and y train and test batch sets.
         '''
-        y_unique, y_counts = y_batch.unique(return_counts=True)
+        y_unique, y_counts = np.unique(y_batch.to_numpy(), return_counts=True)
         stratify = y_batch if y_unique.shape[0] > 1 and 1 not in y_counts else None
         
         train_batch_x, test_batch_x, train_batch_y, test_batch_y = self._prepare_data_to_forward(
@@ -475,119 +522,28 @@ class OptFineTuneTabPFN:
 
 
 
-
-    def _construct_finetune_report(
-            self,
-            total_steps: int,
-            effective_steps: int, 
-            stop_mechanisms: str, 
-            where: Literal["trials", "single"]
-        ) -> None:
+    def get_df_report(self, stats: Literal["aes", "scaler", "val_loss"], what_process: Literal["single_finetune", "opt_finetune"]) -> pd.DataFrame | None:
         '''
-        Construct a report about the finetuning process with the input info. 
-        This is stored in the attribute "trials_reports_aes" if where is equal to "trials" otherwise in "single_report_aes".
-        Returns: None
-        '''
-        info = [total_steps, effective_steps, stop_mechanisms]
-        if where == "trials":
-            self.trials_reports_aes.append(info)
-        else:
-            self.single_report_aes = info
+        Retrieve and organize the internal finetune-related collected info as pandas DataFrames.
+        Is not possible to retrieve with this function the validation loss info for the different trials in the optimized route.
+        To do this one must inspect the optuna Study object which store this info. 
+        In detail see the "trials" attribute which store the Trial objects and "intermediate_values" attribute for each one of them.
 
-
-
-    def _construct_scaler_report(
-            self,
-            scale_factor: float,
-            growth_factor: float,
-            backoff_factor: int,
-            growth_interval: int,
-            where:  Literal["trials", "single"]
-    ) -> None:
-        '''
-        Construct a report with the input info during the finetuning process.
-        The info are stored in the attribute hinted by 'where'.
-        Returns: None
-        '''
-        info = [scale_factor, growth_factor, backoff_factor, growth_interval]
-        if where == "trials":
-            if self.current_trial not in self.trials_reports_scaler.keys():
-                self.trials_reports_scaler[self.current_trial] = [info]
-            else:
-                self.trials_reports_scaler[self.current_trial].append(info)
-        else:
-            self.single_report_scaler.append(info)
-
-
-
-    def get_df_aes_report(self, what: Literal["single_finetune", "opt_finetune"]) -> pd.DataFrame | None:
-        '''
-        Get the Adaptive early stopping report in a pandas Dataframe.
-        
         Parameters:
-        what (Literal["single_finetune", "opt_finetune"]): Specifies the type of report to retrieve.
-            Since the reports are stored in separate attributes, one must choose between:
-            - "single_finetune": Returns the report for the single fine-tuning process (without optimization).
-            - "opt_finetune": Returns the report for the fine-tuning process with optimization.
-
-        Returns: The dataframe or None if no aes information is available.
-        '''
-        data = self.single_report_aes if what == "single_finetune" else self.trials_reports_aes
-        if data:
-            report = self._organize_df_aes_report(data)
-            skipped_steps = report["total_steps"] - report["effective_steps"]
-            report.insert(loc=2, column="skipped_steps", value=skipped_steps)
-            return report
-
-
-    
-    def get_df_scaler_report(self, what: Literal["single_finetune", "opt_finetune"]) ->  pd.DataFrame | dict[str, pd.DataFrame] | None:
-        '''
-        Organizes and retrieves the scaler report/s as Pandas DataFrames.
+            stats (Literal["aes", "scaler", "val_loss]): 
+                Which info to retrieve, the ones related to the AES procedure, to the gradient scaler or to the validation loss.
+            what_process (Literal["single_finetune", "opt_finetune"]): Of which process to retrive the info: 
+                - "single_finetune" for the info collected about the finetune strategy with fixed HPs.
+                - "opt_finetune" for the info collected about the finetune strategy with learned HPs.
         
-        Parameters:
-            what (Literal["single_finetune", "opt_finetune"]): Specifies the type of report to retrieve.
-                Since the reports are stored in separate attributes, one must choose between:
-                - "single_finetune": Returns the report for the single fine-tuning process (without optimization).
-                - "opt_finetune": Returns the report for the fine-tuning process with optimization.
-        
-        Returns: None if the specified report is unavailable. 
-        A single DataFrame if what="single_finetune".
-        A dictionary of DataFrames if what="opt_finetune".
+        Returns: The DataFrame or None if the target information is not available.
         '''
-        report = None
+        if stats == "val_loss" and what_process == "opt_finetune":
+            raise ValueError("To retrieve info about the validation losses for the different trials inspect the optuna Study object.")
         
-        if what == "single_finetune":
-            if self.single_report_scaler:
-                report = self._organize_df_scaler_report(self.single_report_scaler)
+        if stats == "aes":
+            return get_df_aes_report(self, what_process)
+        elif stats == "scaler":
+            return get_df_scaler_report(self, what_process)
         else:
-            if self.trials_reports_scaler:
-                report = {}
-                for k, v in self.trials_reports_scaler.items():
-                    report[k] = self._organize_df_scaler_report(v)
-
-        return report
-
-
-
-    @staticmethod
-    def _organize_df_aes_report(list_report: list | list[list]) -> pd.DataFrame:
-        '''
-        Helps to organize a single aes dataframe report takin the list/s with aes info.
-        '''
-        index = None
-        if isinstance(list_report[0], list):
-            index = index=["trial" + str(i) for i in range(len(list_report))]
-        else:
-            list_report = [list_report]
-        return pd.DataFrame(list_report, index=index, columns=["total_steps", "effective_steps", "stop_mechanisms"])
-
-
-
-    @staticmethod
-    def _organize_df_scaler_report(list_report: list[list]) -> pd.DataFrame:
-        '''
-        Helps to generate a single scaler dataframe report taking the list with the step lists info. 
-        '''
-        index = ["step" + str(i) for i in range(0, len(list_report))]
-        return pd.DataFrame(data=list_report, index=index, columns=["scale_factor", "growth_factor", "backoff_factor", "growth_interval"])
+            return get_df_val_loss_report(self)

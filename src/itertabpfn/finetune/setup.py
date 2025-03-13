@@ -46,8 +46,8 @@ class FineTuneSetup:
 def infer_minmax_batch_sizes(array: np.ndarray | pd.DataFrame | pd.Series) -> tuple[int, int]:
     '''
     Retrieve the minimum and maximum batch sizes to try in a HPO process based on euristics.
-    The function takes in input both 2D and 1D data structure. 
-    In the first case the 0 dimension is used to determine the number of samples.
+    The function takes in input both 1D and 2D data structure. 
+    In the latter case the 0 dimension is used to determine the number of samples.
     Parameters:
         array (np.ndarray | pd.DataFrame | pd.Series): array-like structure from which the number of samples is inferred.
     Returns: A binary tuple with the minimum and maximum batch size values.
@@ -69,8 +69,8 @@ def infer_minmax_batch_sizes(array: np.ndarray | pd.DataFrame | pd.Series) -> tu
 def infer_batch_size(array: np.ndarray | pd.DataFrame | pd.Series) -> int:
     '''
     Retrieve a single batch size value based on euristics.
-    The function takes in input both 2D and 1D data structure. 
-    In the first case the 0 dimension is used to determine the number of samples.
+    The function takes in input both 1D and 2D data structure. 
+    In the latter case the 0 dimension is used to determine the number of samples.
     Parameters:
         array (np.ndarray | pd.DataFrame | pd.Series): array-like structure from which the number of samples is inferred.
     Returns: The batch size.
@@ -89,8 +89,8 @@ def infer_time_limit(array: np.ndarray | pd.DataFrame | pd.Series) -> float:
     '''
     Infer the time limit based on the number of samples and euristics.
     The idea is to give more time to bigger data and less time to smaller ones that are more likely to overfit.
-    The function takes in input both 2D and 1D data structure. 
-    In the first case the 0 dimension is used to determine the number of samples.
+    The function takes in input both 1D and 2D data structure.
+    In the latter case the 0 dimension is used to determine the number of samples.
      Parameters:
         array (np.ndarray | pd.DataFrame | pd.Series): array-like structure from which the number of samples is inferred.
     Returns: The estimated time limit in seconds.
